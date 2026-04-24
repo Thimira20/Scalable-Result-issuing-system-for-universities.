@@ -1,0 +1,222 @@
+# =============================================================
+# PART 1 — docker-compose.yml
+# Infrastructure: MySQL, Redis, MongoDB
+# Services: auth (4001), result (4002), admin (4003), notification (4004)
+#
+# Part 2 will ADD: Zookeeper, Kafka, Debezium, RabbitMQ, Bridge
+# =============================================================
+
+version: "3.9"
+
+# ── Named volumes ─────────────────────────────────────────────
+# Docker manages these on the host. Data survives container restarts.
+volumes:
+  mysql_data:
+  mongo_data:
+  redis_data:
+
+# ── Shared network ─────────────────────────────────────────────
+# All containers can reach each other by SERVICE NAME as hostname.
+# e.g., auth-service connects to mysql at host "mysql", port 3306.
+networks:
+  exam_net:
+    driver: bridge
+
+services:
+
+  # ──────────────────────────────────────────────────────────────
+  # 1. MYSQL
+  #    • Hosts BOTH auth_db and exam_db (two logical databases, one server)
+  #    • Binlog enabled in ROW mode — required for Debezium CDC (Part 2)
+  #    • Init scripts in db/mysql-init/ run automatically on first start
+  # ──────────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    # Binlog flags are CRITICAL for Debezium:
+    #   --binlog-format=ROW      → captures full row data, not just SQL
+    #   --binlog-row-image=FULL  → captures before AND after image of each row
+    #   --log-bin=mysql-bin      → enables binary logging
+    #   --server-id=1            → unique ID required for replication protocol
+    command: >
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --log-bin=mysql-bin
+      --server-id=1
+      --default-authentication-plugin=mysql_native_password
+    ports:
+      - "3306:3306"            # exposed so you can connect with MySQL Workbench
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./db/mysql-init:/docker-entrypoint-initdb.d   # runs *.sql files alphabetically on first boot
+    networks:
+      - exam_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ──────────────────────────────────────────────────────────────
+  # 2. REDIS
+  #    • Used by Result Service as a cache layer
+  #    • Key pattern: result:{student_id}  → JSON string of all results
+  #    • TTL: 3600 seconds (1 hour).  Admin Service deletes these keys on publish.
+  # ──────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - exam_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────────────
+  # 3. MONGODB
+  #    • Owned exclusively by Notification Service
+  #    • Schema-flexible: notification logs don't need rigid table structure
+  #    • Each document stores: student_id, email, status, message, timestamp
+  # ──────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:6
+    container_name: mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - exam_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────────────
+  # 4. AUTH SERVICE (port 4001)
+  #    • Google OAuth 2.0 + JWT issuance
+  #    • Owns auth_db
+  # ──────────────────────────────────────────────────────────────
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: auth-service
+    restart: unless-stopped
+    ports:
+      - "4001:4001"
+    environment:
+      PORT: 4001
+      JWT_SECRET: ${JWT_SECRET}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: auth_db
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - exam_net
+
+  # ──────────────────────────────────────────────────────────────
+  # 5. RESULT SERVICE (port 4002)
+  #    • Serves student results with Redis cache-aside pattern
+  #    • Reads from exam_db (never writes)
+  # ──────────────────────────────────────────────────────────────
+  result-service:
+    build:
+      context: ./services/result-service
+      dockerfile: Dockerfile
+    container_name: result-service
+    restart: unless-stopped
+    ports:
+      - "4002:4002"
+    environment:
+      PORT: 4002
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_URL: ${REDIS_URL}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: exam_db
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - exam_net
+
+  # ──────────────────────────────────────────────────────────────
+  # 6. ADMIN SERVICE (port 4003)
+  #    • CSV upload endpoint (multer)
+  #    • SAGA Orchestrator added in Part 3
+  #    • Writes to exam_db.results; triggers Debezium CDC indirectly
+  # ──────────────────────────────────────────────────────────────
+  admin-service:
+    build:
+      context: ./services/admin-service
+      dockerfile: Dockerfile
+    container_name: admin-service
+    restart: unless-stopped
+    ports:
+      - "4003:4003"
+    environment:
+      PORT: 4003
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_URL: ${REDIS_URL}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: exam_db
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - exam_net
+
+  # ──────────────────────────────────────────────────────────────
+  # 7. NOTIFICATION SERVICE (port 4004)
+  #    • In Part 1: health check + MongoDB connection only
+  #    • Part 2 adds: RabbitMQ consumer + nodemailer email sending
+  # ──────────────────────────────────────────────────────────────
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    container_name: notification-service
+    restart: unless-stopped
+    ports:
+      - "4004:4004"
+    environment:
+      PORT: 4004
+      MONGO_URI: ${MONGO_URI}
+      EMAIL_USER: ${EMAIL_USER}
+      EMAIL_PASS: ${EMAIL_PASS}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - exam_net
