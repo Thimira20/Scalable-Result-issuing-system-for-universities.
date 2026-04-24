@@ -139,11 +139,23 @@ async function getStudentEmail(studentId) {
       'SELECT email, name FROM users WHERE id = ?',
       [studentId]
     );
-    if (rows.length > 0) return rows[0];
-    return { email: `student${studentId}@example.com`, name: `Student ${studentId}` };
+
+    if (rows.length > 0) {
+      // ✅ Student exists in auth_db → they authenticated via Google → safe to notify
+      return rows[0];  // { email, name }
+    }
+
+    // ⛔ No row found → this student_id was never Google-authenticated.
+    // The CSV may contain student IDs for people who haven't logged in yet.
+    // We return null so processEvent can skip publishing to RabbitMQ.
+    // This prevents sending emails to addresses we don't actually have.
+    console.log(`[bridge] Student ${studentId} has no auth_db record (not authenticated) — skipping notification`);
+    return null;
+
   } catch (err) {
-    console.warn(`[bridge] Could not fetch email for student ${studentId}:`, err.message);
-    return { email: `student${studentId}@example.com`, name: `Student ${studentId}` };
+    // DB error is different from "not found" — log it clearly but still skip.
+    console.error(`[bridge] DB error fetching email for student ${studentId}:`, err.message);
+    return null;
   }
 }
 
@@ -190,7 +202,18 @@ async function processEvent(eventJson) {
   console.log(`[bridge] Processing ${op === 'c' ? 'INSERT' : 'UPDATE'} event for student ${after.student_id}`);
 
   // ── Message Enrichment: fetch email from auth_db ─────────────────────
-  const { email, name } = await getStudentEmail(after.student_id);
+  // Returns { email, name } if the student authenticated via Google, or null if not.
+  const student = await getStudentEmail(after.student_id);
+
+  if (!student) {
+    // Student result was published in the CSV but this student never logged in.
+    // We have no verified email for them → skip silently.
+    // When they eventually sign in via Google, their email will be in auth_db
+    // and future result updates will trigger a notification.
+    return;
+  }
+
+  const { email, name } = student;
 
   // ── Build the RabbitMQ message ────────────────────────────────────────
   // This is the message the Notification Service will receive.
