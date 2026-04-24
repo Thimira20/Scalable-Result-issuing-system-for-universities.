@@ -1,0 +1,39 @@
+{
+  "name": "exam-results-connector",
+  "config": {
+    "_comment_connector_class": "This tells Debezium to use the MySQL CDC plugin. Other plugins exist for PostgreSQL, MongoDB, etc.",
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+
+    "_comment_connection": "Debezium connects to MySQL as a replication SLAVE using the debezium user (created in 02-exam-db.sql)",
+    "database.hostname": "mysql",
+    "database.port": "3306",
+    "database.user": "debezium",
+    "database.password": "debeziumpassword",
+
+    "_comment_server_id": "A unique ID for this Debezium instance. Must match --server-id in MySQL config. MySQL uses this to track which replicas have received which binlog events.",
+    "database.server.id": "2",
+
+    "_comment_topic_prefix": "All Kafka topics created by this connector will be prefixed with this value. Topic name = {prefix}.{database}.{table} = exam_db.exam_db.results",
+    "topic.prefix": "exam_db",
+
+    "_comment_filter": "Only watch exam_db (not auth_db). Only watch the results table (not exams or saga_state — those changes don't need notifications).",
+    "database.include.list": "exam_db",
+    "table.include.list": "exam_db.results",
+
+    "_comment_schema_history": "Debezium maintains an internal schema history — it tracks DDL changes (ALTER TABLE, etc.) so it can correctly interpret binlog events even if the schema changed over time. Stored as a Kafka topic.",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "schema-changes.exam_db",
+
+    "_comment_decimal": "By default, MySQL DECIMAL fields are encoded as base64 bytes in Debezium events. Setting 'double' makes them a regular floating-point number — much easier to work with in the bridge.",
+    "decimal.handling.mode": "double",
+
+    "_comment_snapshot": "initial = on first start, Debezium reads ALL existing rows and publishes them as 'r' (read) events. 'schema_only' = only capture the schema, skip existing rows. 'never' = don't snapshot at all. We use 'schema_only' so we don't send emails for old data on startup.",
+    "snapshot.mode": "schema_only",
+
+    "_comment_converters": "These control how Kafka messages are serialized. JsonConverter = plain JSON (no Avro/Protobuf schema registry needed). schemas.enable=false removes the verbose JSON Schema wrapper, giving us clean flat JSON.",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
