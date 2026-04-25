@@ -1,36 +1,41 @@
 /**
- * ADMIN SERVICE — index.js
+ * ADMIN SERVICE — index.js  (Part 3: SAGA Orchestrator integrated)
  * Port: 4003
  *
- * Responsibility:
- *   • Accept CSV file uploads from admin users
- *   • Parse CSV and upsert results into MySQL exam_db
- *   • Invalidate Redis cache for affected students
- *   • Expose SAGA status endpoint (full SAGA orchestrator added in Part 3)
+ * What changed from Part 1/2:
+ *   ✅ POST /admin/upload now delegates to runPublishSAGA() instead of
+ *      doing inline MySQL + Redis work. The SAGA tracks every step in the
+ *      saga_state table and runs compensations if anything fails.
  *
- * CSV Format expected:
- *   student_id,exam_id,score,grade
- *   1,1,88.5,A
- *   2,1,72.0,B
+ * How the SAGA fits into the upload flow:
  *
- * Multer:
- *   multer is Express middleware for handling multipart/form-data (file uploads).
- *   We use memoryStorage() — the file lives in RAM as a Buffer, never touches disk.
- *   This is fine for CSVs (small files). For large files, use diskStorage instead.
- *
- * SAGA Note:
- *   In Part 3, we'll wrap the upload logic in a SAGA Orchestrator.
- *   For now, it does a simple upsert + cache invalidation without formal saga tracking.
+ *   Browser/curl                Admin Service              saga_state table
+ *       │                           │                            │
+ *       │── POST /admin/upload ────►│                            │
+ *       │   (CSV file + JWT)        │── INSERT saga row ────────►│
+ *       │                           │   { status: STARTED }      │
+ *       │                           │── Step 1: MySQL upsert     │
+ *       │                           │── UPDATE saga ────────────►│
+ *       │                           │   { status: IN_PROGRESS }  │
+ *       │                           │── Step 2: Redis DEL        │
+ *       │                           │── UPDATE saga ────────────►│
+ *       │                           │   { status: COMPLETED }    │
+ *       │◄── 200 { sagaId } ────────│                            │
+ *       │                           │                            │
+ *       │── GET /admin/saga/:id ───►│── SELECT saga_state ──────►│
+ *       │◄── { status, step, ... }──│                            │
  */
 
 require('dotenv').config();
 const express = require('express');
-const multer = require('multer');
-const { parse } = require('csv-parse/sync');  // synchronous CSV parser
-const Redis = require('ioredis');
-const mysql = require('mysql2/promise');
-const cors = require('cors');
+const multer  = require('multer');
+const { parse } = require('csv-parse/sync');
+const Redis   = require('ioredis');
+const mysql   = require('mysql2/promise');
+const cors    = require('cors');
 const { verifyJWT, requireAdmin } = require('./middleware/auth');
+// NEW in Part 3: the SAGA orchestrator
+const { runPublishSAGA } = require('./saga/orchestrator');
 
 const app = express();
 app.use(cors());
@@ -95,27 +100,22 @@ app.get('/admin/exams', verifyJWT, requireAdmin, async (req, res) => {
  * POST /admin/upload
  * Accepts a multipart form with a 'file' field (CSV).
  *
- * Steps (simplified — SAGA wrapper added in Part 3):
- *   1. Parse CSV bytes → array of result objects
- *   2. Bulk upsert into MySQL exam_db.results
- *   3. Invalidate Redis cache for each unique student_id in the CSV
- *   4. Mark published_at = NOW() for all upserted rows
- *
- * Body (form-data):
- *   file: <csv file>
- *
- * Auth: Bearer token with role=admin
+ * Flow (Part 3 — SAGA-wrapped):
+ *   1. Parse + validate the CSV (before SAGA starts — fast-fail on bad input)
+ *   2. Hand records to runPublishSAGA() which orchestrates:
+ *        Step 1 → bulk upsert to MySQL
+ *        Step 2 → delete Redis cache keys
+ *        (Step 3 fires automatically via Debezium)
+ *   3. Return 200 with sagaId so admin can poll GET /admin/saga/:sagaId
  */
 app.post('/admin/upload', verifyJWT, requireAdmin, upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
 
+  // Parse CSV before starting SAGA — reject bad input without touching DB
   let records;
   try {
-    // csv-parse/sync parses synchronously and returns an array of objects.
-    // columns: true → uses the first row as property names
-    // skip_empty_lines: true → ignores blank lines
     records = parse(req.file.buffer.toString('utf8'), {
       columns: true,
       skip_empty_lines: true,
@@ -129,72 +129,34 @@ app.post('/admin/upload', verifyJWT, requireAdmin, upload.single('file'), async 
     return res.status(400).json({ error: 'CSV file is empty' });
   }
 
-  // Validate required columns
   const requiredCols = ['student_id', 'exam_id', 'score', 'grade'];
   const csvCols = Object.keys(records[0]);
   const missing = requiredCols.filter(c => !csvCols.includes(c));
   if (missing.length > 0) {
-    return res.status(400).json({ error: `Missing columns: ${missing.join(', ')}` });
+    return res.status(400).json({ error: `Missing CSV columns: ${missing.join(', ')}` });
   }
 
-  const conn = await db.getConnection();
+  // Delegate all DB + cache work to the SAGA orchestrator.
+  // If any step fails, compensations run automatically inside runPublishSAGA.
   try {
-    await conn.beginTransaction();
+    const result = await runPublishSAGA(db, redis, records);
 
-    // ── Step 1: Bulk upsert ──────────────────────────────────────────
-    // INSERT ... ON DUPLICATE KEY UPDATE handles re-uploads:
-    //   If (student_id, exam_id) already exists → update score, grade, published_at
-    //   If not → insert a new row
-    // This is safe to call multiple times with the same data (idempotent).
-    const affectedStudentIds = new Set();
-
-    for (const row of records) {
-      const studentId = parseInt(row.student_id);
-      const examId = parseInt(row.exam_id);
-      const score = parseFloat(row.score);
-      const grade = row.grade.trim().toUpperCase();
-
-      await conn.execute(
-        `INSERT INTO results (student_id, exam_id, score, grade, published_at)
-         VALUES (?, ?, ?, ?, NOW())
-         ON DUPLICATE KEY UPDATE
-           score = VALUES(score),
-           grade = VALUES(grade),
-           published_at = NOW()`,
-        [studentId, examId, score, grade]
-      );
-
-      affectedStudentIds.add(studentId);
-    }
-
-    await conn.commit();
-    console.log(`[admin-service] Upserted ${records.length} results, affecting students: [${[...affectedStudentIds].join(', ')}]`);
-
-    // ── Step 2: Invalidate Redis cache ───────────────────────────────
-    // For each student whose results changed, delete their cache key.
-    // Next time they query Result Service, it will be a cache miss
-    // and fresh data will be fetched from MySQL.
-    const cacheKeys = [...affectedStudentIds].map(id => `result:${id}`);
-    if (cacheKeys.length > 0) {
-      await redis.del(...cacheKeys);  // redis.del accepts multiple keys
-      console.log(`[admin-service] Invalidated Redis cache keys: ${cacheKeys.join(', ')}`);
-    }
-
-    // Step 3: Debezium (Part 2) will automatically detect the MySQL binlog
-    // changes and publish events to Kafka → RabbitMQ → Notification Service.
-
-    res.json({
+    return res.status(200).json({
       message: 'Results published successfully',
+      sagaId: result.sagaId,
+      status: result.status,
       rowsProcessed: records.length,
-      studentsAffected: [...affectedStudentIds],
+      studentsAffected: result.payload.affectedStudentIds,
+      cacheKeysInvalidated: result.payload.deletedCacheKeys,
     });
 
-  } catch (err) {
-    await conn.rollback();
-    console.error('[admin-service] Upload failed, transaction rolled back:', err.message);
-    res.status(500).json({ error: 'Upload failed', detail: err.message });
-  } finally {
-    conn.release();
+  } catch (sagaErr) {
+    // SAGA failed — compensations already ran inside runPublishSAGA.
+    console.error('[admin-service] SAGA failed:', sagaErr.message);
+    return res.status(500).json({
+      error: 'Upload failed — SAGA rolled back all changes',
+      detail: sagaErr.message,
+    });
   }
 });
 
@@ -217,8 +179,16 @@ app.get('/admin/results', verifyJWT, requireAdmin, async (req, res) => {
 
 /**
  * GET /admin/saga/:sagaId
- * Returns the current state of a SAGA workflow.
- * Full SAGA implementation added in Part 3.
+ * Returns the current state of a specific SAGA run.
+ *
+ * Poll this after POST /admin/upload gives you a sagaId.
+ * status field tells you exactly what happened:
+ *   STARTED      → SAGA created, no steps done yet
+ *   IN_PROGRESS  → Step 1 (MySQL) done, Step 2 in progress
+ *   COMPLETED    → Both steps done, Debezium handling Step 3
+ *   FAILED       → Step 1 failed, nothing written
+ *   COMPENSATING → Step 2 failed, running undo operations
+ *   COMPENSATED  → All changes rolled back successfully
  */
 app.get('/admin/saga/:sagaId', verifyJWT, requireAdmin, async (req, res) => {
   try {
@@ -229,7 +199,31 @@ app.get('/admin/saga/:sagaId', verifyJWT, requireAdmin, async (req, res) => {
     if (rows.length === 0) {
       return res.status(404).json({ error: 'SAGA not found' });
     }
-    res.json(rows[0]);
+    const saga = rows[0];
+    // payload is stored as a JSON string in MySQL — parse it for a clean response
+    if (typeof saga.payload === 'string') {
+      saga.payload = JSON.parse(saga.payload);
+    }
+    res.json(saga);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /admin/sagas
+ * Returns the 20 most recent SAGA runs.
+ * Admin dashboard uses this to show upload history.
+ */
+app.get('/admin/sagas', verifyJWT, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      `SELECT saga_id, type, step, status, created_at, updated_at
+       FROM saga_state
+       ORDER BY created_at DESC
+       LIMIT 20`
+    );
+    res.json({ sagas: rows, count: rows.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
