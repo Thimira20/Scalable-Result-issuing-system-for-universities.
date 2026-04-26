@@ -1,0 +1,19 @@
+{
+  "name": "kafka-rabbitmq-bridge",
+  "version": "1.0.0",
+  "description": "Reads Debezium CDC events from Kafka, enriches with student email, publishes to RabbitMQ",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.4",
+    "dotenv": "^16.4.5",
+    "kafkajs": "^2.2.4",
+    "mysql2": "^3.9.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}

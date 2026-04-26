@@ -1,0 +1,389 @@
+# =============================================================
+# docker-compose.yml — PART 2 (Full Stack)
+#
+# NEW in Part 2 (vs Part 1):
+#   ✅ Zookeeper      — Kafka's cluster coordinator
+#   ✅ Kafka          — message streaming backbone (Debezium's transport)
+#   ✅ Debezium       — reads MySQL binlog, publishes CDC events to Kafka
+#   ✅ RabbitMQ       — task queue for notification jobs (+ mgmt UI)
+#   ✅ Bridge         — Kafka → RabbitMQ connector (our custom Node.js service)
+#   ✅ Notification   — now depends on RabbitMQ (consumer added)
+#
+# HOW THE ASYNC PIPELINE FITS TOGETHER:
+#
+#   MySQL (binlog enabled)
+#     │  binary log (every INSERT/UPDATE/DELETE written here automatically)
+#     ▼
+#   Debezium Connect  (reads binlog via MySQL replication protocol)
+#     │  publishes { before, after, op } JSON to Kafka
+#     ▼
+#   Kafka topic: exam_db.exam_db.results
+#     │  (topic name = {prefix}.{database}.{table})
+#     ▼
+#   kafka-rabbitmq-bridge (our Node.js service using kafkajs + amqplib)
+#     │  enriches message with student email from auth_db
+#     │  publishes to RabbitMQ
+#     ▼
+#   RabbitMQ queue: results.published
+#     │
+#     ▼
+#   notification-service (amqplib consumer)
+#     ├── sends email via nodemailer
+#     └── logs to MongoDB
+#
+# ── NETWORKING NOTE ──────────────────────────────────────────────────────
+# All containers share the "exam_net" bridge network.
+# Inside this network, containers reach each other by SERVICE NAME.
+# Example: kafka-rabbitmq-bridge connects to Kafka at "kafka:9092"
+#          NOT at "localhost:9092" (that would be the container's own loopback).
+# =============================================================
+
+version: "3.9"
+
+volumes:
+  mysql_data:
+  mongo_data:
+  redis_data:
+  rabbitmq_data:   # NEW: persists RabbitMQ messages across restarts
+
+networks:
+  exam_net:
+    driver: bridge
+
+services:
+
+  # ══════════════════════════════════════════════════════════════════════
+  # INFRASTRUCTURE — DATABASES
+  # ══════════════════════════════════════════════════════════════════════
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    # Binlog is REQUIRED for Debezium CDC:
+    #   --binlog-format=ROW      → records full before/after row images
+    #   --binlog-row-image=FULL  → captures all columns, not just changed ones
+    #   --log-bin=mysql-bin      → enables binary log
+    #   --server-id=1            → unique ID in replication topology
+    command: >
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --log-bin=mysql-bin
+      --server-id=1
+      --default-authentication-plugin=mysql_native_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./db/mysql-init:/docker-entrypoint-initdb.d
+    networks:
+      - exam_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - exam_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  mongodb:
+    image: mongo:6
+    container_name: mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - exam_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ══════════════════════════════════════════════════════════════════════
+  # INFRASTRUCTURE — KAFKA STACK (for Debezium CDC)
+  # ══════════════════════════════════════════════════════════════════════
+
+  # ── Zookeeper ────────────────────────────────────────────────────────
+  # Kafka (pre-KRaft mode) uses Zookeeper for:
+  #   • Electing a Kafka broker leader
+  #   • Storing cluster metadata (topic configs, partition assignments)
+  #   • Coordinating consumer group offsets
+  # In production Kafka clusters, Zookeeper is being replaced by KRaft
+  # (Kafka's own consensus protocol), but Debezium still uses Zookeeper-based Kafka.
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181    # Kafka connects to Zookeeper on this port
+      ZOOKEEPER_TICK_TIME: 2000      # Heartbeat interval in ms
+    networks:
+      - exam_net
+
+  # ── Kafka ─────────────────────────────────────────────────────────────
+  # Apache Kafka: a distributed, append-only log.
+  # Every message written to a "topic" is retained for a configurable time.
+  # Multiple consumers can read the same topic independently.
+  #
+  # LISTENER CONFIGURATION (why two listeners?):
+  #   PLAINTEXT://kafka:9092      → used by OTHER CONTAINERS in the Docker network
+  #                                 e.g., Debezium talks to kafka:9092
+  #   PLAINTEXT_HOST://localhost:29092 → used from the HOST machine (your laptop)
+  #                                      e.g., if you run kafkajs on your machine
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "29092:29092"       # external port (host machine access only)
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1      # 1 = single broker (dev only; prod uses 3+)
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"         # Debezium creates its topics automatically
+    networks:
+      - exam_net
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ── Debezium Connect ───────────────────────────────────────────────────
+  # Kafka Connect framework running the Debezium MySQL connector plugin.
+  #
+  # How it works:
+  #   1. You POST a connector config to its REST API (port 8083)
+  #   2. Debezium opens a MySQL connection using the replication protocol
+  #      (same as MySQL primary→replica replication, but Debezium is the "replica")
+  #   3. MySQL streams its binary log to Debezium
+  #   4. Debezium converts each log entry into a JSON "CDC event"
+  #   5. Debezium publishes the event to a Kafka topic
+  #
+  # The image debezium/connect:2.4 already has the MySQL connector plugin bundled.
+  debezium:
+    image: debezium/connect:2.4
+    container_name: debezium
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8083:8083"         # Kafka Connect REST API
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092           # Debezium's Kafka broker
+      GROUP_ID: debezium-connect-group        # Consumer group ID for this Connect cluster
+      CONFIG_STORAGE_TOPIC: debezium_connect_configs   # Kafka topics Debezium uses internally
+      OFFSET_STORAGE_TOPIC: debezium_connect_offsets   # tracks which binlog position was last read
+      STATUS_STORAGE_TOPIC: debezium_connect_statuses
+
+      # JsonConverter: serialize CDC events as plain JSON (no schema registry needed)
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"   # strip JSON schema wrapper → clean flat JSON
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    networks:
+      - exam_net
+
+  # ══════════════════════════════════════════════════════════════════════
+  # INFRASTRUCTURE — RABBITMQ
+  # ══════════════════════════════════════════════════════════════════════
+
+  # ── RabbitMQ ──────────────────────────────────────────────────────────
+  # AMQP message broker — used for the notification job queue.
+  #
+  # Why RabbitMQ instead of just using Kafka all the way?
+  #   • RabbitMQ queues are simpler for task distribution (email jobs)
+  #   • Messages are ACK'd and deleted after processing (clean queue model)
+  #   • Built-in management UI (port 15672) for monitoring queues visually
+  #   • amqplib is simpler than kafkajs for basic producer/consumer patterns
+  #
+  # Ports:
+  #   5672  → AMQP protocol (used by applications)
+  #   15672 → Management Web UI (admin dashboard)
+  #           Login: guest / guest
+  #           URL:   http://localhost:15672
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"     # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - exam_net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ══════════════════════════════════════════════════════════════════════
+  # INFRASTRUCTURE — KAFKA-RABBITMQ BRIDGE
+  # ══════════════════════════════════════════════════════════════════════
+
+  # ── Bridge ────────────────────────────────────────────────────────────
+  # Our custom Node.js service. Sits between Kafka and RabbitMQ.
+  # Reads CDC events from Kafka, enriches them, publishes to RabbitMQ.
+  kafka-rabbitmq-bridge:
+    build:
+      context: ./services/kafka-rabbitmq-bridge
+      dockerfile: Dockerfile
+    container_name: kafka-rabbitmq-bridge
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: kafka:9092               # internal Docker network address
+      KAFKA_TOPIC: exam_db.exam_db.results    # Debezium output topic
+      KAFKA_GROUP_ID: exam-bridge-group
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      RABBITMQ_QUEUE: results.published
+      # Bridge queries auth_db to enrich messages with student email
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: auth_db
+    networks:
+      - exam_net
+
+  # ══════════════════════════════════════════════════════════════════════
+  # APPLICATION SERVICES
+  # ══════════════════════════════════════════════════════════════════════
+
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: auth-service
+    restart: unless-stopped
+    ports:
+      - "4001:4001"
+    environment:
+      PORT: 4001
+      JWT_SECRET: ${JWT_SECRET}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: auth_db
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - exam_net
+
+  result-service:
+    build:
+      context: ./services/result-service
+      dockerfile: Dockerfile
+    container_name: result-service
+    restart: unless-stopped
+    ports:
+      - "4002:4002"
+    environment:
+      PORT: 4002
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_URL: ${REDIS_URL}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: exam_db
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - exam_net
+
+  admin-service:
+    build:
+      context: ./services/admin-service
+      dockerfile: Dockerfile
+    container_name: admin-service
+    restart: unless-stopped
+    ports:
+      - "4003:4003"
+    environment:
+      PORT: 4003
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_URL: ${REDIS_URL}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: exam_db
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - exam_net
+
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    container_name: notification-service
+    restart: unless-stopped
+    ports:
+      - "4004:4004"
+    environment:
+      PORT: 4004
+      MONGO_URI: mongodb://mongodb:27017/notif_db
+      EMAIL_USER: ${EMAIL_USER}
+      EMAIL_PASS: ${EMAIL_PASS}
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - exam_net
