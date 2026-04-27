@@ -162,7 +162,7 @@ pipeline {
                     parallel(
                         'auth-service': {
                             echo "Building auth-service..."
-                            sh """
+                            bat """
                                 docker build \
                                   -t ${IMAGE_PREFIX}/auth-service:latest \
                                   -t ${IMAGE_PREFIX}/auth-service:${env.GIT_SHA} \
@@ -171,7 +171,7 @@ pipeline {
                         },
                         'result-service': {
                             echo "Building result-service..."
-                            sh """
+                            bat """
                                 docker build \
                                   -t ${IMAGE_PREFIX}/result-service:latest \
                                   -t ${IMAGE_PREFIX}/result-service:${env.GIT_SHA} \
@@ -180,7 +180,7 @@ pipeline {
                         },
                         'admin-service': {
                             echo "Building admin-service..."
-                            sh """
+                            bat """
                                 docker build \
                                   -t ${IMAGE_PREFIX}/admin-service:latest \
                                   -t ${IMAGE_PREFIX}/admin-service:${env.GIT_SHA} \
@@ -189,7 +189,7 @@ pipeline {
                         },
                         'notification-service': {
                             echo "Building notification-service..."
-                            sh """
+                            bat """
                                 docker build \
                                   -t ${IMAGE_PREFIX}/notification-service:latest \
                                   -t ${IMAGE_PREFIX}/notification-service:${env.GIT_SHA} \
@@ -198,7 +198,7 @@ pipeline {
                         },
                         'kafka-rabbitmq-bridge': {
                             echo "Building kafka-rabbitmq-bridge..."
-                            sh """
+                            bat """
                                 docker build \
                                   -t ${IMAGE_PREFIX}/kafka-rabbitmq-bridge:latest \
                                   -t ${IMAGE_PREFIX}/kafka-rabbitmq-bridge:${env.GIT_SHA} \
@@ -228,7 +228,7 @@ pipeline {
                 script {
                     ['auth-service', 'result-service', 'admin-service',
                      'notification-service', 'kafka-rabbitmq-bridge'].each { svc ->
-                        sh """
+                        bat """
                             echo "Testing ${svc} starts without crashing..."
                             # Run the container, wait 5 seconds, check exit code
                             # --rm removes the container after it stops
@@ -273,7 +273,7 @@ pipeline {
                 // withCredentials injects the PAT into the env as GHCR_TOKEN.
                 // Jenkins masks it in logs — you'll see *** instead of the real token.
                 withCredentials([string(credentialsId: 'ghcr-pat', variable: 'GHCR_TOKEN')]) {
-                    sh """
+                    bat """
                         # Login to GHCR
                         # --password-stdin reads password from stdin (more secure than -p flag)
                         echo \$GHCR_TOKEN | docker login ghcr.io \
@@ -287,7 +287,7 @@ pipeline {
                     script {
                         ['auth-service', 'result-service', 'admin-service',
                          'notification-service', 'kafka-rabbitmq-bridge'].each { svc ->
-                            sh """
+                            bat """
                                 echo "Pushing ${svc}..."
                                 docker push ${IMAGE_PREFIX}/${svc}:latest
                                 docker push ${IMAGE_PREFIX}/${svc}:${env.GIT_SHA}
@@ -366,10 +366,10 @@ pipeline {
         always {
             // Always clean up — remove dangling images to save disk space.
             // "dangling" = images with no tag (replaced by a newer build)
-            sh 'docker image prune -f || true'
+            bat 'docker image prune -f || true'
 
             // Always logout from GHCR — don't leave credentials in Docker config
-            sh 'docker logout ghcr.io || true'
+            bat 'docker logout ghcr.io || true'
         }
     }
 }
