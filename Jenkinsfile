@@ -91,23 +91,38 @@ pipeline {
         stage('Checkout') {
             steps {
                 echo '🔄 Checking out source code from GitHub...'
-                // "scm" = the Source Control Management config from the job.
-                // This automatically checks out the right branch and commit.
-                checkout scm
 
-                // Capture the short git SHA (first 7 characters of commit hash).
-                // We tag images with both "latest" AND the commit SHA.
-                // Why SHA tag? Lets you roll back to an exact commit's image.
-                // Example: ghcr.io/thimira20/auth-service:abc1234
+                // WHY explicit git() instead of "checkout scm":
+                //   "checkout scm" only works reliably in Multibranch Pipeline jobs.
+                //   For a regular Pipeline job (which you likely created), scm is
+                //   either undefined or missing credentials → crash.
+                //
+                //   The explicit git() step works for ANY job type because we
+                //   specify everything ourselves: URL, branch, credentials.
+                //
+                // credentialsId: must match the credential ID you created in Jenkins
+                //   Manage Jenkins → Credentials → github-credentials
+                git(
+                    url: 'https://github.com/Thimira20/Scalable-Result-issuing-system-for-universities.git',
+                    branch: 'main',
+                    credentialsId: 'github-credentials'
+                )
+
+                // Capture the git commit SHA for image tagging.
+                // Example: if HEAD is abc1234, images get tagged:
+                //   ghcr.io/thimira20/auth-service:latest
+                //   ghcr.io/thimira20/auth-service:abc1234
                 script {
                     env.GIT_SHA = sh(
                         script: 'git rev-parse --short HEAD',
                         returnStdout: true
                     ).trim()
-                    env.GIT_BRANCH_CLEAN = env.BRANCH_NAME?.replaceAll('/', '-') ?: 'main'
+                    // BRANCH_NAME is only set in Multibranch Pipeline jobs.
+                    // For a regular Pipeline job, we default to 'main'.
+                    env.GIT_BRANCH_CLEAN = env.BRANCH_NAME ? env.BRANCH_NAME.replaceAll('/', '-') : 'main'
                 }
 
-                echo "📌 Commit: ${env.GIT_SHA} on branch: ${env.GIT_BRANCH_CLEAN}"
+                echo "✅ Checked out commit: ${env.GIT_SHA} (branch: ${env.GIT_BRANCH_CLEAN})"
             }
         }
 
@@ -248,13 +263,10 @@ pipeline {
         //   withCredentials() injects the PAT as an env var for this block only.
         //   After the block, the secret is scrubbed from memory.
         stage('Push to GHCR') {
-            // Only push on main/master branch — don't push feature branch images
-            when {
-                anyOf {
-                    branch 'main'
-                    branch 'master'
-                }
-            }
+            // NOTE: Removed "when { branch 'main' }" — that condition uses
+            // BRANCH_NAME which is NULL in regular Pipeline jobs (only set in
+            // Multibranch Pipeline). When it's null, the whole stage gets
+            // silently SKIPPED. We always push here instead.
             steps {
                 echo '📦 Pushing images to GitHub Container Registry (GHCR)...'
 
