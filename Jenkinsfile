@@ -103,7 +103,7 @@ pipeline {
                 // credentialsId: must match the credential ID you created in Jenkins
                 //   Manage Jenkins → Credentials → github-credentials
                 git(
-                    url: 'https://github.com/Thimira20/Scalable-Result-issuing-system-for-universities.git',
+                    url: 'https://github.com/Thimira20/Scalable-Result-issuing-system-for-universities..git',
                     branch: 'main',
                     credentialsId: 'github-credentials'
                 )
