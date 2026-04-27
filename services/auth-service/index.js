@@ -29,6 +29,25 @@ const mysql = require('mysql2/promise');
 const cors = require('cors');
 const { verifyJWT, requireAdmin } = require('./middleware/auth');
 
+// ── ADMIN_EMAILS — auto-promote without SQL ────────────────────────────────
+// Add comma-separated emails to ADMIN_EMAILS in your .env:
+//   ADMIN_EMAILS=alice@gmail.com,bob@gmail.com
+// On every login: if the user's Google email is in this list, their role
+// is automatically set to 'admin' in the DB. No SQL queries needed!
+//
+// Example flow:
+//   1. You add your email to ADMIN_EMAILS in .env
+//   2. You sign in with Google
+//   3. Auth Service sees your email → UPDATE users SET role='admin'
+//   4. JWT issued with role='admin'
+//   5. You now have admin access everywhere
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',')
+  .map(e => e.trim().toLowerCase())
+  .filter(Boolean);  // remove empty strings
+
+console.log(`[auth-service] Admin emails configured: [${ADMIN_EMAILS.join(', ') || 'none'}]`);
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -81,9 +100,8 @@ passport.use(new GoogleStrategy(
 
       // ── Upsert user ────────────────────────────────────────────────────
       // INSERT ... ON DUPLICATE KEY UPDATE:
-      //   If this google_id has never logged in → INSERT a new row (role defaults to 'student')
-      //   If they've logged in before → UPDATE name/email (role is preserved!)
-      //   We never overwrite 'role' here intentionally — admins are set manually in DB.
+      //   New user  → INSERT with role='student' (default)
+      //   Returning → UPDATE only name/email, role stays as-is
       await db.execute(
         `INSERT INTO users (google_id, email, name)
          VALUES (?, ?, ?)
@@ -91,14 +109,25 @@ passport.use(new GoogleStrategy(
         [googleId, email, name]
       );
 
-      // Fetch the full user row (we need the id and role for the JWT)
+      // ── ADMIN_EMAILS auto-promotion ────────────────────────────────────
+      // If this email is listed in ADMIN_EMAILS env var, ensure they are admin.
+      // This runs on EVERY login, so you can add someone to the list and
+      // they become admin the next time they sign in — no SQL query needed!
+      if (ADMIN_EMAILS.includes(email.toLowerCase())) {
+        await db.execute(
+          'UPDATE users SET role = ? WHERE google_id = ?',
+          ['admin', googleId]
+        );
+        console.log(`[auth-service] Auto-promoted ${email} to admin (ADMIN_EMAILS match)`);
+      }
+
+      // Fetch the full user row (id + role needed for JWT payload)
       const [rows] = await db.execute(
         'SELECT id, email, role FROM users WHERE google_id = ?',
         [googleId]
       );
       const user = rows[0];
 
-      // Pass user to the next step (serializeUser / callback route)
       return done(null, user);
     } catch (err) {
       return done(err, null);
@@ -201,6 +230,88 @@ app.get('/auth/students', verifyJWT, requireAdmin, async (req, res) => {
        ORDER BY name ASC, id ASC`
     );
     res.json({ students: rows, count: rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── User Management Routes (admin only) ───────────────────────────────────
+
+/**
+ * GET /auth/users
+ * Returns all registered users.
+ * Admin dashboard calls this to show a user list with role-change buttons.
+ *
+ * Example response:
+ *   { users: [{ id: 1, email: "alice@gmail.com", name: "Alice", role: "student" }, ...] }
+ */
+app.get('/auth/users', verifyJWT, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT id, google_id, email, name, role, created_at FROM users ORDER BY created_at DESC'
+    );
+    res.json({ users: rows, count: rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * PATCH /auth/users/:id/role
+ * Change a user's role without touching the database directly.
+ *
+ * Body: { "role": "admin" }  OR  { "role": "student" }
+ *
+ * Example — promote user #3 to admin:
+ *   curl -X PATCH http://localhost:4001/auth/users/3/role \
+ *        -H "Authorization: Bearer <ADMIN_JWT>" \
+ *        -H "Content-Type: application/json" \
+ *        -d '{"role": "admin"}'
+ *
+ * NOTE: The change takes effect at the NEXT login.
+ *   The current JWT is still valid until it expires (24h).
+ *   For immediate effect, the user should log out and log back in.
+ */
+app.patch('/auth/users/:id/role', verifyJWT, requireAdmin, async (req, res) => {
+  const targetId = parseInt(req.params.id);
+  const { role } = req.body;
+
+  // Validate role value
+  if (!['student', 'admin'].includes(role)) {
+    return res.status(400).json({
+      error: 'Invalid role. Must be "student" or "admin"'
+    });
+  }
+
+  // Prevent admin from accidentally demoting themselves
+  if (targetId === req.user.user_id && role === 'student') {
+    return res.status(400).json({
+      error: 'You cannot demote yourself. Have another admin do it.'
+    });
+  }
+
+  try {
+    const [result] = await db.execute(
+      'UPDATE users SET role = ? WHERE id = ?',
+      [role, targetId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Fetch updated user for the response
+    const [rows] = await db.execute(
+      'SELECT id, email, name, role FROM users WHERE id = ?',
+      [targetId]
+    );
+
+    console.log(`[auth-service] Role changed: user ${targetId} → ${role} (by admin ${req.user.email})`);
+    res.json({
+      message: `Role updated to "${role}" successfully`,
+      user: rows[0],
+      note: 'Change takes effect at next login (new JWT will carry the updated role)',
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
