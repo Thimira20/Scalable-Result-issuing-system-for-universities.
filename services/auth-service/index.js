@@ -173,25 +173,21 @@ app.get('/auth/google/callback',
   (req, res) => {
     const user = req.user;
 
-    // Issue JWT — this is what every other service will verify
     const token = jwt.sign(
       {
         user_id: user.id,
         email: user.email,
-        role: user.role,          // 'student' or 'admin'
+        role: user.role,
       },
       process.env.JWT_SECRET,
       { expiresIn: '24h', algorithm: 'HS256' }
     );
 
-    console.log(`[auth-service] JWT issued for ${user.email} (role: ${user.role})`);
+    console.log('[auth-service] JWT issued for ' + user.email + ' (role: ' + user.role + ')');
 
-    // In production redirect to frontend: res.redirect(`http://localhost:3000/callback?token=${token}`)
-    res.json({
-      message: 'Login successful',
-      token,
-      user: { id: user.id, email: user.email, role: user.role },
-    });
+    res.redirect(
+      FRONTEND_URL + '/auth/callback?token=' + encodeURIComponent(token)
+    );
   }
 );
 
@@ -218,6 +214,24 @@ app.get('/auth/verify', (req, res) => {
     res.json({ valid: true, payload: decoded });
   } catch (err) {
     res.status(401).json({ valid: false, error: err.message });
+  }
+});
+
+/**
+ * GET /auth/students
+ * Admin-only endpoint to fetch students for bulk result entry.
+ */
+app.get('/auth/students', verifyJWT, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, name, email, role
+       FROM users
+       WHERE role = 'student'
+       ORDER BY name ASC, id ASC`
+    );
+    res.json({ students: rows, count: rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -305,6 +319,7 @@ app.patch('/auth/users/:id/role', verifyJWT, requireAdmin, async (req, res) => {
 
 // ── Start ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4001;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 initDB().then(() => {
   app.listen(PORT, () => {
     console.log(`[auth-service] Running on port ${PORT}`);

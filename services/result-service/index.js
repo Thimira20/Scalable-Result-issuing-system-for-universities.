@@ -110,7 +110,7 @@ app.get('/results/:studentId', verifyJWT, async (req, res) => {
          r.grade,
          r.published_at
        FROM results r
-       JOIN exams e ON r.exam_id = e.id
+       LEFT JOIN exams e ON r.exam_id = e.id
        WHERE r.student_id = ?
          AND r.published_at IS NOT NULL
        ORDER BY r.published_at DESC`,
@@ -146,7 +146,7 @@ app.get('/results/exam/:examId', verifyJWT, async (req, res) => {
   try {
     const [rows] = await db.execute(
       `SELECT r.*, e.name AS exam_name FROM results r
-       JOIN exams e ON r.exam_id = e.id
+       LEFT JOIN exams e ON r.exam_id = e.id
        WHERE r.exam_id = ?`,
       [parseInt(examId)]
     );

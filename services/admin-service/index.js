@@ -168,7 +168,7 @@ app.get('/admin/results', verifyJWT, requireAdmin, async (req, res) => {
   try {
     const [rows] = await db.execute(
       `SELECT r.*, e.name AS exam_name FROM results r
-       JOIN exams e ON r.exam_id = e.id
+       LEFT JOIN exams e ON r.exam_id = e.id
        ORDER BY r.published_at DESC`
     );
     res.json({ results: rows, count: rows.length });
