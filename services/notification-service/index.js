@@ -18,7 +18,6 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const { startConsumer } = require('./consumer');
 
 const app = express();
 app.use(cors());
@@ -50,6 +49,9 @@ const notificationSchema = new mongoose.Schema({
 // registering the model — this is what makes mongoose.model('Notification') work in consumer.js
 mongoose.model('Notification', notificationSchema);
 const Notification = mongoose.model('Notification');
+
+// Load consumer only after model registration so consumer.js can safely access the model.
+const { startConsumer } = require('./consumer');
 
 // ══════════════════════════════════════════════════════════════════════════
 // MONGODB CONNECTION

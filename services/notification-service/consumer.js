@@ -139,14 +139,12 @@ function buildEmailContent(data) {
   return { subject, html, text };
 }
 
-// ── MongoDB Notification Model ─────────────────────────────────────────────
-// This model is defined here to keep consumer.js self-contained.
-// In index.js we connect to MongoDB first, then start this consumer.
-const NotificationLog = mongoose.model('Notification');  // re-use model registered in index.js
-
 // ── Main consumer function ────────────────────────────────────────────────
 
 async function startConsumer() {
+  // index.js registers the schema before calling startConsumer().
+  const NotificationLog = mongoose.model('Notification');
+
   // ── 1. Create email transporter ──────────────────────────────────────
   transporter = await createTransporter();
 
