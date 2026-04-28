@@ -6,3 +6,4 @@ build/
 .DS_Store
 uploads/
 *.csv
+k8s/secrets.yaml

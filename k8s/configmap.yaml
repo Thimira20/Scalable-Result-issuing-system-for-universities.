@@ -1,0 +1,59 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# KUBERNETES CONFIGMAP — exam-config
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# WHAT IS A CONFIGMAP?
+# ────────────────────
+# A ConfigMap stores NON-SENSITIVE configuration data as key-value pairs.
+# Anything that's not a password/token/secret goes here.
+#
+# Secret vs ConfigMap:
+# ┌──────────────────────────┬───────────────────────────────────────┐
+# │ ConfigMap                │ Secret                                │
+# ├──────────────────────────┼───────────────────────────────────────┤
+# │ Ports, URLs, DB names    │ Passwords, tokens, API keys           │
+# │ Stored as plain text     │ Stored as base64                      │
+# │ Safe to commit to Git    │ NEVER commit to Git                   │
+# │ Visible in dashboard     │ Hidden by default in dashboard        │
+# └──────────────────────────┴───────────────────────────────────────┘
+#
+# HOW PODS READ FROM CONFIGMAP:
+#   env:
+#     - name: MYSQL_HOST
+#       valueFrom:
+#         configMapKeyRef:
+#           name: exam-config
+#           key: MYSQL_HOST     ← reads "mysql-service" from below
+# ═══════════════════════════════════════════════════════════════════════════
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: exam-config
+  labels:
+    app: exam-system
+data:
+  # ── Database hostnames ──
+  # In Kubernetes, each Service gets a DNS name: <service-name>.<namespace>.svc.cluster.local
+  # Short form: just use the service name (works within the same namespace).
+  MYSQL_HOST: "mysql-service"
+  MYSQL_PORT: "3306"
+  REDIS_URL: "redis://redis-service:6379"
+  MONGO_URI: "mongodb://mongodb-service:27017/notif_db"
+
+  # ── RabbitMQ ──
+  RABBITMQ_URL: "amqp://guest:guest@rabbitmq-service:5672"
+
+  # ── Inter-service URLs ──
+  # In K8s, services find each other by their Service DNS name, not by container name.
+  # Docker Compose uses container names (e.g., "auth-service").
+  # K8s uses Service names (e.g., "auth-service" — same in our case, but it's DNS not Docker).
+  AUTH_SERVICE_URL: "http://auth-service:4001"
+  RESULT_SERVICE_URL: "http://result-service:4002"
+  ADMIN_SERVICE_URL: "http://admin-service:4003"
+
+  # ── Kafka (for bridge) ──
+  KAFKA_BROKERS: "kafka-service:9092"
+  KAFKA_TOPIC: "exam_db.exam_db.results"
+  KAFKA_GROUP_ID: "exam-bridge-group"
+  RABBITMQ_QUEUE: "results.published"

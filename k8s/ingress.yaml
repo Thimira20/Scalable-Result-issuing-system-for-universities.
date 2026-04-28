@@ -1,0 +1,112 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# NGINX INGRESS — Routes external traffic to internal K8s Services
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# WHAT IS AN INGRESS?
+# ───────────────────
+# Without Ingress, each service has its own port (4001, 4002, 4003, 4004).
+# Users would need to remember: "Auth is on 4001, Results is on 4002..."
+#
+# With Ingress, there's ONE entry point. The URL PATH decides which
+# service handles the request:
+#
+#   http://exam.local/auth/...     → auth-service:4001
+#   http://exam.local/results/...  → result-service:4002
+#   http://exam.local/admin/...    → admin-service:4003
+#
+# Think of Ingress as a smart receptionist at a building entrance:
+#   "You need the Auth department? Third floor." → routes to auth-service
+#   "You need Results? Fifth floor."             → routes to result-service
+#
+# HOW IT WORKS TECHNICALLY:
+# ─────────────────────────
+#   1. Minikube runs an Nginx pod (the Ingress Controller)
+#   2. This YAML tells Nginx the routing rules
+#   3. Nginx listens on port 80/443 and proxies to backend Services
+#
+#   Client (browser/curl)
+#       │
+#       ▼
+#   Nginx Ingress Controller (port 80)
+#       │
+#       ├── /auth/*      → auth-service:4001
+#       ├── /results/*   → result-service:4002 (load-balanced across HPA Pods!)
+#       ├── /admin/*     → admin-service:4003
+#       └── /notifications/* → notification-service:4004
+#
+# SETUP (run once):
+# ─────────────────
+#   minikube addons enable ingress
+#   # Add to your hosts file (C:\Windows\System32\drivers\etc\hosts):
+#   #   <minikube-ip>  exam.local
+#   # Get minikube IP:
+#   #   minikube ip
+#
+# ═══════════════════════════════════════════════════════════════════════════
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: exam-ingress
+  labels:
+    app: exam-system
+  annotations:
+    # Tell K8s to use the Nginx Ingress Controller
+    kubernetes.io/ingress.class: "nginx"
+
+    # Nginx-specific rewriting:
+    # When /auth/google hits Nginx, it forwards to auth-service:4001/auth/google
+    # (preserves the path as-is, which is what our Express routes expect)
+    nginx.ingress.kubernetes.io/use-regex: "true"
+
+    # CORS — allow frontend portals to call these APIs
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+
+    # File upload size limit — needed for CSV uploads to admin-service
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+
+spec:
+  rules:
+    # ── Single host: exam.local ──────────────────────────────────────────
+    # In production, this would be your real domain: results.university.edu
+    - host: exam.local
+      http:
+        paths:
+          # ── /auth/* → Auth Service ──────────────────────────────────────
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 4001
+
+          # ── /results/* → Result Service ─────────────────────────────────
+          # All result queries go here. If HPA has scaled to 5 Pods,
+          # the result-service K8s Service load-balances across all 5.
+          - path: /results
+            pathType: Prefix
+            backend:
+              service:
+                name: result-service
+                port:
+                  number: 4002
+
+          # ── /admin/* → Admin Service ────────────────────────────────────
+          - path: /admin
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-service
+                port:
+                  number: 4003
+
+          # ── /notifications/* → Notification Service ─────────────────────
+          - path: /notifications
+            pathType: Prefix
+            backend:
+              service:
+                name: notification-service
+                port:
+                  number: 4004

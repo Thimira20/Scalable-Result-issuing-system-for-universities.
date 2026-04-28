@@ -1,0 +1,169 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# MYSQL — Deployment + Service + PersistentVolumeClaim
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# THREE KUBERNETES OBJECTS IN ONE FILE (separated by ---):
+#
+#   1. PersistentVolumeClaim (PVC)
+#      "I need 5GB of disk storage that survives Pod restarts"
+#
+#   2. Deployment
+#      "Run 1 Pod with the MySQL container, mount the storage,
+#       set env vars from Secret and ConfigMap"
+#
+#   3. Service
+#      "Give this Pod a stable DNS name (mysql-service) so other
+#       Pods can connect to it"
+#
+# HOW K8S STORAGE WORKS:
+# ──────────────────────
+#  In Docker Compose:  volumes: [mysql_data:/var/lib/mysql]
+#  In Kubernetes:      PersistentVolumeClaim → PersistentVolume → actual disk
+#
+#  PVC = "I need X GB of storage"
+#  PV  = "Here's the actual disk" (Minikube auto-provisions this)
+#
+#  The Pod mounts the PVC at /var/lib/mysql. If the Pod crashes and
+#  restarts, the data is still there (on the PV, not inside the container).
+#
+# HOW K8S NETWORKING (SERVICES) WORK:
+# ────────────────────────────────────
+#  In Docker Compose:  containers find each other by container name
+#  In Kubernetes:      Pods are ephemeral (they get new IPs every restart)
+#
+#  A Service gives a STABLE DNS name + IP to a set of Pods.
+#  Other Pods connect to "mysql-service:3306" — the Service routes
+#  traffic to whichever Pod is running MySQL.
+#
+#  ClusterIP (default type) = accessible ONLY within the cluster.
+#  NodePort = also accessible from outside via <NodeIP>:<NodePort>.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── PersistentVolumeClaim ─────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+  labels:
+    app: exam-system
+    component: mysql
+spec:
+  accessModes:
+    - ReadWriteOnce     # One Pod can mount this volume read-write at a time
+  resources:
+    requests:
+      storage: 5Gi      # 5 gigabytes — more than enough for exam data
+
+---
+
+# ── Deployment ────────────────────────────────────────────────────────────
+# A Deployment tells K8s: "Make sure exactly N replicas of this Pod are
+# running at all times. If one crashes, start a new one."
+#
+# For databases, we use replicas: 1 (stateful workloads typically use
+# StatefulSet, but Deployment is simpler for learning).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  labels:
+    app: exam-system
+    component: mysql
+spec:
+  replicas: 1           # Only 1 MySQL instance (not horizontally scalable easily)
+  selector:
+    matchLabels:
+      component: mysql  # "Find Pods with this label and manage them"
+  template:
+    # Everything below defines the Pod template
+    metadata:
+      labels:
+        component: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports:
+            - containerPort: 3306
+          # MySQL CLI args — same as docker-compose command:
+          args:
+            - "--binlog-format=ROW"
+            - "--binlog-row-image=FULL"
+            - "--log-bin=mysql-bin"
+            - "--server-id=1"
+            - "--default-authentication-plugin=mysql_native_password"
+          # Environment variables from Secret
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: exam-secrets
+                  key: MYSQL_ROOT_PASSWORD
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: exam-secrets
+                  key: MYSQL_USER
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: exam-secrets
+                  key: MYSQL_PASSWORD
+          # Mount the persistent volume at MySQL's data directory
+          volumeMounts:
+            - name: mysql-storage
+              mountPath: /var/lib/mysql
+            - name: mysql-init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          # Resource limits — tell K8s how much CPU/RAM this container needs
+          resources:
+            requests:           # Minimum guaranteed resources
+              cpu: "250m"       # 250 millicores = 0.25 CPU
+              memory: "512Mi"   # 512 megabytes
+            limits:             # Maximum allowed resources
+              cpu: "1000m"
+              memory: "1Gi"
+          # Liveness probe — K8s checks if MySQL is alive every 30s
+          # If 3 checks fail, K8s kills and restarts the Pod
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "localhost"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "localhost"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: mysql-storage
+          persistentVolumeClaim:
+            claimName: mysql-pvc
+        # ConfigMap to mount SQL init files
+        # NOTE: For init scripts, you'd create a ConfigMap from the files:
+        #   kubectl create configmap mysql-init --from-file=db/mysql-init/
+        - name: mysql-init
+          configMap:
+            name: mysql-init-scripts
+            optional: true    # Don't fail if ConfigMap doesn't exist yet
+
+---
+
+# ── Service ───────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+  labels:
+    app: exam-system
+    component: mysql
+spec:
+  # ClusterIP = internal only. Other Pods connect via "mysql-service:3306"
+  type: ClusterIP
+  selector:
+    component: mysql     # Route traffic to Pods with label component=mysql
+  ports:
+    - port: 3306         # Port exposed by the Service
+      targetPort: 3306   # Port the container listens on
+      protocol: TCP

@@ -1,0 +1,86 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# KAFKA-RABBITMQ BRIDGE — Deployment (no Service needed)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Note: No Service manifest here because the bridge has NO HTTP endpoint.
+# It's a background worker that reads from Kafka and writes to RabbitMQ.
+# Other services never need to "call" it — it runs autonomously.
+# ═══════════════════════════════════════════════════════════════════════════
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-rabbitmq-bridge
+  labels:
+    app: exam-system
+    component: kafka-rabbitmq-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: kafka-rabbitmq-bridge
+  template:
+    metadata:
+      labels:
+        component: kafka-rabbitmq-bridge
+    spec:
+      containers:
+        - name: kafka-rabbitmq-bridge
+          image: kafka-rabbitmq-bridge:latest
+          imagePullPolicy: IfNotPresent
+          # No ports — this is a background worker
+          env:
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: exam-config
+                  key: KAFKA_BROKERS
+            - name: KAFKA_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: exam-config
+                  key: KAFKA_TOPIC
+            - name: KAFKA_GROUP_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: exam-config
+                  key: KAFKA_GROUP_ID
+            - name: RABBITMQ_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: exam-config
+                  key: RABBITMQ_URL
+            - name: RABBITMQ_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: exam-config
+                  key: RABBITMQ_QUEUE
+            - name: MYSQL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: exam-config
+                  key: MYSQL_HOST
+            - name: MYSQL_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: exam-config
+                  key: MYSQL_PORT
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: exam-secrets
+                  key: MYSQL_USER
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: exam-secrets
+                  key: MYSQL_PASSWORD
+            - name: MYSQL_DATABASE
+              value: "auth_db"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

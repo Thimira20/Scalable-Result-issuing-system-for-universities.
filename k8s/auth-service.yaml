@@ -1,0 +1,131 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# AUTH SERVICE — Deployment + Service
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# DEPLOYMENT vs DOCKER COMPOSE — KEY DIFFERENCES:
+# ────────────────────────────────────────────────
+# Docker Compose:
+#   auth-service:
+#     build: ./services/auth-service    ← builds from Dockerfile
+#     environment:
+#       JWT_SECRET: ${JWT_SECRET}       ← reads from .env file
+#
+# Kubernetes:
+#   image: auth-service:latest          ← pulls from a container REGISTRY
+#   env:
+#     - name: JWT_SECRET
+#       valueFrom:
+#         secretKeyRef:
+#           name: exam-secrets
+#           key: JWT_SECRET              ← reads from K8s Secret object
+#
+# In Docker Compose, you "build" images locally.
+# In Kubernetes, you must push images to a registry (Docker Hub, GCR, ECR)
+# and K8s PULLS them. For Minikube, you can build locally using:
+#   eval $(minikube docker-env)    ← makes your terminal use Minikube's Docker
+#   docker build -t auth-service:latest ./services/auth-service
+# ═══════════════════════════════════════════════════════════════════════════
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  labels:
+    app: exam-system
+    component: auth-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: auth-service
+  template:
+    metadata:
+      labels:
+        component: auth-service
+    spec:
+      containers:
+        - name: auth-service
+          image: auth-service:latest
+          # imagePullPolicy: Never  ← uncomment for Minikube local builds
+          #   This tells K8s "don't try to pull from Docker Hub, use local image"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 4001
+          env:
+            - name: PORT
+              value: "4001"
+            # Secrets — pulled from K8s Secret
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: exam-secrets
+                  key: JWT_SECRET
+            - name: GOOGLE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: exam-secrets
+                  key: GOOGLE_CLIENT_ID
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: exam-secrets
+                  key: GOOGLE_CLIENT_SECRET
+            # Config — pulled from ConfigMap
+            - name: MYSQL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: exam-config
+                  key: MYSQL_HOST
+            - name: MYSQL_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: exam-config
+                  key: MYSQL_PORT
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: exam-secrets
+                  key: MYSQL_USER
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: exam-secrets
+                  key: MYSQL_PASSWORD
+            - name: MYSQL_DATABASE
+              value: "auth_db"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /auth/health
+              port: 4001
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /auth/health
+              port: 4001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  labels:
+    app: exam-system
+    component: auth-service
+spec:
+  type: ClusterIP
+  selector:
+    component: auth-service
+  ports:
+    - port: 4001
+      targetPort: 4001
